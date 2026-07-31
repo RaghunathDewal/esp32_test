@@ -31,10 +31,26 @@ async def mic_to_server(ws, stream):
         await ws.send(data)
 
 
-async def server_to_speaker(ws, out_stream):
+async def receive_from_server(ws, playback_queue: asyncio.Queue):
+    """Pulls messages off the socket as fast as they arrive and hands them
+    to the playback queue. Kept separate from playback so a slow speaker
+    write never blocks us from noticing a turn-complete/interrupt signal."""
     async for message in ws:
         if isinstance(message, (bytes, bytearray)):
-            await asyncio.to_thread(out_stream.write, message)
+            await playback_queue.put(message)
+        elif message == "__TURN_COMPLETE__":
+            # Gemini's turn ended. Any audio still sitting in the queue
+            # belongs to a reply that's already finished; if a new turn's
+            # audio starts landing next, draining old + new together is
+            # what causes the "repeats with lag" effect. Flush it.
+            while not playback_queue.empty():
+                playback_queue.get_nowait()
+
+
+async def play_from_queue(playback_queue: asyncio.Queue, out_stream):
+    while True:
+        chunk = await playback_queue.get()
+        await asyncio.to_thread(out_stream.write, chunk)
 
 
 async def main(url: str):
@@ -56,9 +72,11 @@ async def main(url: str):
     print(f"Connecting to {url} ...")
     async with websockets.connect(url) as ws:
         print("Connected. Speak into your mic (Ctrl+C to stop).")
+        playback_queue: asyncio.Queue = asyncio.Queue()
         await asyncio.gather(
             mic_to_server(ws, in_stream),
-            server_to_speaker(ws, out_stream),
+            receive_from_server(ws, playback_queue),
+            play_from_queue(playback_queue, out_stream),
         )
 
 

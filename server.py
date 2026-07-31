@@ -27,7 +27,8 @@ import os
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
 from google.genai import types
-
+from dotenv import load_dotenv
+load_dotenv() 
 from tools import TOOLS, TOOL_IMPLEMENTATIONS
 
 logging.basicConfig(level=logging.INFO)
@@ -53,10 +54,6 @@ CONFIG = types.LiveConnectConfig(
         voice_config=types.VoiceConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
         )
-    ),
-    context_window_compression=types.ContextWindowCompressionConfig(
-        trigger_tokens=104857,
-        sliding_window=types.SlidingWindow(target_tokens=52428),
     ),
     tools=TOOLS,
 )
@@ -100,6 +97,12 @@ async def websocket_endpoint(websocket: WebSocket):
                             logger.info("Gemini text: %s", text)
                         if tool_call := response.tool_call:
                             await handle_tool_call(session, tool_call)
+
+                    # Gemini signals end-of-turn here. If the user interrupts
+                    # mid-reply, a new turn starts before the old one drains —
+                    # tell the client to flush anything still queued so old
+                    # audio doesn't overlap/repeat under the new reply.
+                    await websocket.send_text("__TURN_COMPLETE__")
 
             await asyncio.gather(esp32_to_gemini(), gemini_to_esp32())
 
