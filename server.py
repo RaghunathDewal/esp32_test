@@ -55,6 +55,10 @@ CONFIG = types.LiveConnectConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
         )
     ),
+    # Enables transcription of the user's speech and Gemini's spoken
+    # reply, so we can log both without doing our own speech-to-text.
+    input_audio_transcription=types.AudioTranscriptionConfig(),
+    output_audio_transcription=types.AudioTranscriptionConfig(),
     tools=TOOLS,
 )
 
@@ -97,6 +101,22 @@ async def websocket_endpoint(websocket: WebSocket):
                             logger.info("Gemini text: %s", text)
                         if tool_call := response.tool_call:
                             await handle_tool_call(session, tool_call)
+
+                        # Log the user's transcribed question and Gemini's
+                        # transcribed spoken answer.
+                        server_content = getattr(response, "server_content", None)
+                        if server_content is not None:
+                            input_transcript = getattr(
+                                server_content, "input_transcription", None
+                            )
+                            if input_transcript is not None and input_transcript.text:
+                                logger.info("USER SAID: %s", input_transcript.text)
+
+                            output_transcript = getattr(
+                                server_content, "output_transcription", None
+                            )
+                            if output_transcript is not None and output_transcript.text:
+                                logger.info("GEMINI SAID: %s", output_transcript.text)
 
                     # Gemini signals end-of-turn here. If the user interrupts
                     # mid-reply, a new turn starts before the old one drains —
