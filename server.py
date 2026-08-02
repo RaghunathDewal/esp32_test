@@ -29,13 +29,13 @@ from fastapi.responses import FileResponse
 from google import genai
 from google.genai import types
 from websockets.exceptions import ConnectionClosedError
-from dotenv import load_dotenv
-load_dotenv() 
+
 from tools import TOOLS, TOOL_IMPLEMENTATIONS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gemini-esp32-bridge")
-
+from dotenv import load_dotenv
+load_dotenv() 
 MODEL = "models/gemini-3.1-flash-live-preview"
 SEND_SAMPLE_RATE = 16000  # audio coming FROM the ESP32 mic
 RECEIVE_SAMPLE_RATE = 24000  # audio going TO the ESP32 speaker
@@ -57,10 +57,11 @@ CONFIG = types.LiveConnectConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
         )
     ),
-    # Gemini transcribes the user's spoken audio and sends the text back
-    # alongside the audio reply — this is what lets us log what the user
-    # asked, without doing our own speech-to-text.
+    # Per Google's docs: enabling both directions of transcription lets us
+    # log what the user said AND what Gemini said, without doing our own
+    # speech-to-text.
     input_audio_transcription=types.AudioTranscriptionConfig(),
+    output_audio_transcription=types.AudioTranscriptionConfig(),
     tools=TOOLS,
 )
 
@@ -104,9 +105,33 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
 
                 async def esp32_to_gemini():
-                    """Read binary audio frames from the ESP32 and forward to Gemini."""
+                    """Read binary audio frames from the ESP32 and forward to Gemini.
+
+                    Per Google's docs: if the incoming audio stream pauses for
+                    more than ~1 second, an audio_stream_end signal should be
+                    sent to flush Gemini's cached audio buffer — otherwise
+                    stale buffered state can interfere with recognizing the
+                    next utterance cleanly.
+                    """
+                    STREAM_PAUSE_TIMEOUT = 1.0  # seconds
+                    stream_ended = False
+
                     while True:
-                        data = await websocket.receive_bytes()
+                        try:
+                            data = await asyncio.wait_for(
+                                websocket.receive_bytes(), timeout=STREAM_PAUSE_TIMEOUT
+                            )
+                        except asyncio.TimeoutError:
+                            if not stream_ended:
+                                await session.send_realtime_input(audio_stream_end=True)
+                                stream_ended = True
+                                logger.info(
+                                    "No audio for %.1fs — sent audio_stream_end",
+                                    STREAM_PAUSE_TIMEOUT,
+                                )
+                            continue
+
+                        stream_ended = False
                         await session.send_realtime_input(
                             audio=types.Blob(
                                 data=data,
@@ -124,11 +149,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     """
                     async for response in session.receive():
                         try:
+                            # IMPORTANT (per Google's docs): a single event
+                            # from gemini-3.1-flash-live-preview can contain
+                            # MULTIPLE parts at once — e.g. audio data AND
+                            # a turn_complete flag in the same event. Using
+                            # `continue` after handling audio would skip
+                            # turn_complete/transcription when they arrive
+                            # bundled with the last audio chunk of a turn —
+                            # so every field below is checked unconditionally,
+                            # not gated behind an early continue.
                             if data := response.data:
                                 await websocket.send_bytes(data)
-                                continue
+
                             if text := response.text:
                                 logger.info("Gemini text: %s", text)
+
                             if tool_call := response.tool_call:
                                 await handle_tool_call(session, tool_call)
 
@@ -139,6 +174,21 @@ async def websocket_endpoint(websocket: WebSocket):
                                 )
                                 if input_transcript is not None and input_transcript.text:
                                     logger.info("USER SAID: %s", input_transcript.text)
+
+                                output_transcript = getattr(
+                                    server_content, "output_transcription", None
+                                )
+                                if output_transcript is not None and output_transcript.text:
+                                    logger.info("GEMINI SAID: %s", output_transcript.text)
+
+                                # VAD interruption: the user started talking
+                                # while Gemini was still replying. Per docs,
+                                # the ongoing generation is cancelled server
+                                # side — we must stop/flush playback on our
+                                # end too, same as on turn_complete.
+                                if getattr(server_content, "interrupted", False):
+                                    await websocket.send_text("__TURN_COMPLETE__")
+                                    logger.info("Interrupted by user.")
 
                                 if getattr(server_content, "turn_complete", False):
                                     # Tell the client to flush any stale queued

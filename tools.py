@@ -11,7 +11,7 @@ from google.genai import types
 def get_current_time() -> dict:
     """Returns the current date and time."""
     now = datetime.datetime.now()
-    return {"current_time": now.strftime("%Y-%m-%d %H:%M:%S")}
+    return {"result": now.strftime("%Y-%m-%d %H:%M:%S")}
 
 
 def add_numbers(a: float, b: float) -> dict:
