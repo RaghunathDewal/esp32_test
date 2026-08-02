@@ -1,22 +1,5 @@
 """
 WebSocket bridge server: ESP32  <-->  this server  <-->  Gemini Live API.
-
-Deploy this on Render (or any host) as a small always-on WebSocket service.
-Your ESP32 firmware connects to  wss://<your-render-app>.onrender.com/ws
-and streams raw 16-bit PCM mono audio (16kHz) as binary WebSocket frames.
-
-This server:
-  1. Accepts the ESP32 WebSocket connection.
-  2. Opens a Gemini Live session per connection.
-  3. Forwards every binary frame it receives from the ESP32 -> Gemini
-     (as realtime audio input).
-  4. Forwards every audio chunk it receives from Gemini -> the ESP32
-     (as binary frames, 24kHz PCM16, for the ESP32 to play back).
-  5. Runs the same test tools (get_current_time, add_numbers) as the
-     desktop script, so you can sanity-check tool calling end-to-end.
-
-This is a TESTING-LEVEL server: no auth, no reconnection hardening,
-no rate limiting. Add those before using it for anything real.
 """
 
 import asyncio
@@ -27,16 +10,17 @@ import os
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
 from google.genai import types
+from websockets.exceptions import ConnectionClosedError
 from dotenv import load_dotenv
-load_dotenv() 
+load_dotenv()
 from tools import TOOLS, TOOL_IMPLEMENTATIONS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gemini-esp32-bridge")
 
 MODEL = "models/gemini-3.1-flash-live-preview"
-SEND_SAMPLE_RATE = 16000  # audio coming FROM the ESP32 mic
-RECEIVE_SAMPLE_RATE = 24000  # audio going TO the ESP32 speaker
+SEND_SAMPLE_RATE = 16000      # audio coming FROM the ESP32 mic
+RECEIVE_SAMPLE_RATE = 24000   # audio going TO the ESP32 speaker
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
@@ -55,8 +39,6 @@ CONFIG = types.LiveConnectConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
         )
     ),
-    # Enables transcription of the user's speech and Gemini's spoken
-    # reply, so we can log both without doing our own speech-to-text.
     input_audio_transcription=types.AudioTranscriptionConfig(),
     output_audio_transcription=types.AudioTranscriptionConfig(),
     tools=TOOLS,
@@ -65,7 +47,6 @@ CONFIG = types.LiveConnectConfig(
 
 @app.get("/")
 async def health():
-    """Simple health check endpoint Render can ping."""
     return {"status": "ok", "service": "gemini-esp32-bridge"}
 
 
@@ -78,69 +59,136 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.close(code=1011, reason="Server missing GEMINI_API_KEY")
         return
 
-    try:
-        async with client.aio.live.connect(model=MODEL, config=CONFIG) as session:
+    # set = safe to forward mic audio; cleared = a tool call is in flight
+    can_send_audio = asyncio.Event()
+    can_send_audio.set()
 
-            async def esp32_to_gemini():
-                """Read binary audio frames from the ESP32 and forward to Gemini."""
-                while True:
-                    data = await websocket.receive_bytes()
-                    await session.send_realtime_input(
-                        audio=types.Blob(data=data, mime_type="audio/pcm")
-                    )
+    MAX_RECONNECTS = 5
+    reconnect_count = 0
 
-            async def gemini_to_esp32():
-                """Read Gemini's audio/tool output and forward audio to the ESP32."""
-                while True:
-                    turn = session.receive()
-                    async for response in turn:
-                        if data := response.data:
-                            await websocket.send_bytes(data)
-                            continue
-                        if text := response.text:
-                            logger.info("Gemini text: %s", text)
-                        if tool_call := response.tool_call:
-                            await handle_tool_call(session, tool_call)
-
-                        # Log the user's transcribed question and Gemini's
-                        # transcribed spoken answer.
-                        server_content = getattr(response, "server_content", None)
-                        if server_content is not None:
-                            input_transcript = getattr(
-                                server_content, "input_transcription", None
-                            )
-                            if input_transcript is not None and input_transcript.text:
-                                logger.info("USER SAID: %s", input_transcript.text)
-
-                            output_transcript = getattr(
-                                server_content, "output_transcription", None
-                            )
-                            if output_transcript is not None and output_transcript.text:
-                                logger.info("GEMINI SAID: %s", output_transcript.text)
-
-                    # Gemini signals end-of-turn here. If the user interrupts
-                    # mid-reply, a new turn starts before the old one drains —
-                    # tell the client to flush anything still queued so old
-                    # audio doesn't overlap/repeat under the new reply.
-                    await websocket.send_text("__TURN_COMPLETE__")
-
-            await asyncio.gather(esp32_to_gemini(), gemini_to_esp32())
-
-    except WebSocketDisconnect:
-        logger.info("ESP32 client disconnected")
-    except Exception:
-        logger.exception("Error in websocket session")
+    while reconnect_count <= MAX_RECONNECTS:
         try:
-            await websocket.close(code=1011, reason="Internal error")
-        except Exception:
-            pass
+            async with client.aio.live.connect(model=MODEL, config=CONFIG) as session:
+                if reconnect_count > 0:
+                    logger.info("Reconnected to Gemini (attempt %d)", reconnect_count)
+
+                async def esp32_to_gemini():
+                    """Forward the client's mic audio to Gemini, unmodified."""
+                    while True:
+                        data = await websocket.receive_bytes()
+                        await can_send_audio.wait()
+                        await session.send_realtime_input(
+                            audio=types.Blob(
+                                data=data,
+                                mime_type=f"audio/pcm;rate={SEND_SAMPLE_RATE}",
+                            )
+                        )
+
+                async def gemini_to_esp32():
+                    """Forward Gemini's audio to the client, one TURN at a time.
+
+                    session.receive() yields a SINGLE model turn and then the
+                    generator terminates (it breaks internally on turn_complete
+                    -- see the SDK source). So it must be re-created for each
+                    turn inside this outer loop. Dropping the outer loop makes
+                    the bridge die silently after the first reply.
+                    """
+                    while True:
+                        turn = session.receive()
+
+                        async for response in turn:
+                            try:
+                                # A single event can carry several parts at once
+                                # (audio + transcript + turn_complete), so every
+                                # field is checked -- never `continue` after audio.
+                                if data := response.data:
+                                    await websocket.send_bytes(data)
+
+                                if tool_call := response.tool_call:
+                                    logger.info("Tool call requested: %s", tool_call)
+                                    can_send_audio.clear()
+                                    try:
+                                        await handle_tool_call(session, tool_call)
+                                    finally:
+                                        can_send_audio.set()
+
+                                sc = getattr(response, "server_content", None)
+                                if sc is not None:
+                                    it = getattr(sc, "input_transcription", None)
+                                    if it is not None and it.text:
+                                        logger.info("TRANSCRIPT [User]: %s", it.text)
+
+                                    ot = getattr(sc, "output_transcription", None)
+                                    if ot is not None and ot.text:
+                                        logger.info("TRANSCRIPT [Gemini]: %s", ot.text)
+
+                                    # Barge-in: flush client playback immediately
+                                    # rather than waiting for the turn to wind down.
+                                    if getattr(sc, "interrupted", False):
+                                        logger.info("Interrupted by user.")
+                                        await websocket.send_text("__TURN_COMPLETE__")
+                            except Exception:
+                                # One odd event must never kill the loop.
+                                logger.exception("Error handling one response — continuing")
+
+                        # Generator ended => this turn is done. Tell the client to
+                        # flush playback, then loop to receive the NEXT turn.
+                        logger.info("Turn complete.")
+                        await websocket.send_text("__TURN_COMPLETE__")
+
+                sender = asyncio.create_task(esp32_to_gemini())
+                receiver = asyncio.create_task(gemini_to_esp32())
+
+                done, pending = await asyncio.wait(
+                    [sender, receiver], return_when=asyncio.FIRST_EXCEPTION
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+
+                for task in done:
+                    if task.exception():
+                        raise task.exception()
+
+            return
+
+        except WebSocketDisconnect:
+            logger.info("ESP32 client disconnected")
+            return
+        except ConnectionClosedError as e:
+            # Gemini's socket dropped (keepalive timeout / network blip).
+            # Reconnect to Gemini while keeping the client's socket open.
+            reconnect_count += 1
+            logger.warning(
+                "Gemini connection dropped (%s) — reconnecting (%d/%d)",
+                e, reconnect_count, MAX_RECONNECTS,
+            )
+            if reconnect_count > MAX_RECONNECTS:
+                logger.error("Max Gemini reconnects exceeded, giving up")
+                try:
+                    await websocket.close(code=1011, reason="Gemini connection unstable")
+                except Exception:
+                    pass
+                return
+            can_send_audio.set()
+            continue
+        except Exception as e:
+            logger.exception("Error in websocket session")
+            for attr in ("code", "status_code", "reason", "response_json", "message", "args"):
+                if hasattr(e, attr):
+                    logger.error("  %s = %r", attr, getattr(e, attr))
+            try:
+                await websocket.close(code=1011, reason="Internal error")
+            except Exception:
+                pass
+            return
 
 
 async def handle_tool_call(session, tool_call):
-    """Executes each requested function call and sends the results back to Gemini."""
+    """Execute each requested function call and return the results to Gemini."""
     function_responses = []
     for fc in tool_call.function_calls:
-        logger.info("Tool call: %s(%s)", fc.name, fc.args)
+        logger.info("Executing Tool: %s with args: %s", fc.name, fc.args)
         impl = TOOL_IMPLEMENTATIONS.get(fc.name)
         if impl is None:
             result = {"error": f"Unknown tool: {fc.name}"}
@@ -149,13 +197,14 @@ async def handle_tool_call(session, tool_call):
                 result = impl(**(fc.args or {}))
             except Exception as e:  # noqa: BLE001
                 result = {"error": str(e)}
-        logger.info("Tool result: %s -> %s", fc.name, json.dumps(result))
+        logger.info("Tool Result [%s]: %s", fc.name, json.dumps(result))
 
         function_responses.append(
             types.FunctionResponse(id=fc.id, name=fc.name, response=result)
         )
 
     await session.send_tool_response(function_responses=function_responses)
+    logger.info("Tool response sent.")
 
 
 if __name__ == "__main__":
