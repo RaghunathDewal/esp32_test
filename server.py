@@ -114,27 +114,38 @@ async def websocket_endpoint(websocket: WebSocket):
                 not by the iterator ending (it doesn't end between turns).
                 """
                 async for response in session.receive():
-                    if data := response.data:
-                        await websocket.send_bytes(data)
-                        continue
-                    if text := response.text:
-                        logger.info("Gemini text: %s", text)
-                    if tool_call := response.tool_call:
-                        await handle_tool_call(session, tool_call)
+                    logger.info("Received a response from Gemini")
+                    try:
+                        if data := response.data:
+                            await websocket.send_bytes(data)
+                            continue
+                        if text := response.text:
+                            logger.info("Gemini text: %s", text)
+                        if tool_call := response.tool_call:
+                            await handle_tool_call(session, tool_call)
 
-                    server_content = getattr(response, "server_content", None)
-                    if server_content is not None:
-                        input_transcript = getattr(
-                            server_content, "input_transcription", None
+                        server_content = getattr(response, "server_content", None)
+                        if server_content is not None:
+                            input_transcript = getattr(
+                                server_content, "input_transcription", None
+                            )
+                            if input_transcript is not None and input_transcript.text:
+                                logger.info("USER SAID: %s", input_transcript.text)
+
+                            if getattr(server_content, "turn_complete", False):
+                                # Tell the client to flush any stale queued
+                                # audio so an interruption's new turn doesn't
+                                # overlap with the previous one's leftovers.
+                                await websocket.send_text("__TURN_COMPLETE__")
+                                logger.info("Turn complete.")
+                    except Exception:
+                        # A parsing quirk in one response (e.g. an
+                        # unexpected field shape) must not kill the whole
+                        # receive loop — that would silently stop us from
+                        # ever hearing the user again after one turn.
+                        logger.exception(
+                            "Error handling one response — continuing loop"
                         )
-                        if input_transcript is not None and input_transcript.text:
-                            logger.info("USER SAID: %s", input_transcript.text)
-
-                        if getattr(server_content, "turn_complete", False):
-                            # Tell the client to flush any stale queued
-                            # audio so an interruption's new turn doesn't
-                            # overlap with the previous one's leftovers.
-                            await websocket.send_text("__TURN_COMPLETE__")
 
             sender = asyncio.create_task(esp32_to_gemini())
             receiver = asyncio.create_task(gemini_to_esp32())

@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Gemini Bridge — WebSocket Test Console</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --accent: #3fb950;
+    --accent-dim: #2ea043;
+    --danger: #f85149;
+    --warn: #d29922;
+    --mono: 'SF Mono', 'Consolas', 'Menlo', monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .card {
+    width: 100%;
+    max-width: 640px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .header {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .header h1 {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0;
+    letter-spacing: 0.2px;
+  }
+  .header .subtitle {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+  .status-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    flex-shrink: 0;
+    transition: background 0.2s;
+  }
+  .status-dot.connecting { background: var(--warn); animation: pulse 1s infinite; }
+  .status-dot.connected { background: var(--accent); }
+  .status-dot.error { background: var(--danger); }
+  @keyframes pulse { 50% { opacity: 0.4; } }
+
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .body { padding: 24px; }
+
+  .url-field {
+    width: 100%;
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text);
+    margin-bottom: 16px;
+  }
+  .url-field:focus { outline: none; border-color: var(--accent-dim); }
+
+  .controls {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 20px;
+  }
+  button {
+    flex: 1;
+    padding: 11px 16px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: #21262d;
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  button:hover:not(:disabled) { background: #2d333b; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary {
+    background: var(--accent-dim);
+    border-color: var(--accent-dim);
+    color: #0d1117;
+  }
+  button.primary:hover:not(:disabled) { background: var(--accent); }
+  button.danger-btn {
+    background: transparent;
+    border-color: var(--danger);
+    color: var(--danger);
+  }
+  button.danger-btn:hover:not(:disabled) { background: rgba(248, 81, 73, 0.1); }
+
+  .meters {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+  .meter { flex: 1; }
+  .meter-label {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+  }
+  .meter-track {
+    height: 6px;
+    background: #0d1117;
+    border-radius: 3px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  .meter-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    transition: width 0.05s linear;
+  }
+  .meter-fill.rx { background: #58a6ff; }
+
+  .log {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+    height: 200px;
+    overflow-y: auto;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .log-line { white-space: pre-wrap; word-break: break-word; }
+  .log-line.info { color: var(--text-dim); }
+  .log-line.ok { color: var(--accent); }
+  .log-line.err { color: var(--danger); }
+  .log-line.rx { color: #58a6ff; }
+  .log-line .ts { color: #484f58; margin-right: 8px; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="header">
+    <div>
+      <h1>WebSocket Test Console</h1>
+      <div class="subtitle">gemini-esp32-bridge</div>
+    </div>
+    <div class="status-row">
+      <div id="statusDot" class="status-dot"></div>
+      <span id="statusText">disconnected</span>
+    </div>
+  </div>
+
+  <div class="body">
+    <input id="urlField" class="url-field" type="text" />
+
+    <div class="controls">
+      <button id="connectBtn" class="primary">Connect</button>
+      <button id="micBtn" disabled>Start mic</button>
+      <button id="disconnectBtn" class="danger-btn" disabled>Disconnect</button>
+    </div>
+
+    <div class="meters">
+      <div class="meter">
+        <div class="meter-label"><span>MIC (sending)</span><span id="txLabel">16 kHz</span></div>
+        <div class="meter-track"><div id="txMeter" class="meter-fill"></div></div>
+      </div>
+      <div class="meter">
+        <div class="meter-label"><span>SPEAKER (receiving)</span><span id="rxLabel">24 kHz</span></div>
+        <div class="meter-track"><div id="rxMeter" class="meter-fill rx"></div></div>
+      </div>
+    </div>
+
+    <div id="log" class="log"></div>
+  </div>
+</div>
+
+<script>
+const urlField = document.getElementById('urlField');
+const connectBtn = document.getElementById('connectBtn');
+const micBtn = document.getElementById('micBtn');
+const disconnectBtn = document.getElementById('disconnectBtn');
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+const logEl = document.getElementById('log');
+const txMeter = document.getElementById('txMeter');
+const rxMeter = document.getElementById('rxMeter');
+
+const SEND_SAMPLE_RATE = 16000;
+const RECEIVE_SAMPLE_RATE = 24000;
+
+let ws = null;
+let micStream = null;
+let micContext = null;
+let micSourceNode = null;
+let micProcessorNode = null;
+let playContext = null;
+let playbackQueue = [];
+let nextPlayTime = 0;
+
+function log(msg, cls) {
+  const line = document.createElement('div');
+  line.className = 'log-line ' + (cls || 'info');
+  const ts = new Date().toLocaleTimeString();
+  line.innerHTML = '<span class="ts">' + ts + '</span>' + escapeHtml(msg);
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function setStatus(state, text) {
+  statusDot.className = 'status-dot ' + state;
+  statusText.textContent = text;
+}
+
+function setMeter(el, level) {
+  const pct = Math.min(100, Math.max(0, level * 100));
+  el.style.width = pct + '%';
+}
+
+// ---- Connect / disconnect --------------------------------------------
+
+connectBtn.addEventListener('click', () => {
+  const url = urlField.value.trim();
+  if (!url) { log('Enter a WebSocket URL first.', 'err'); return; }
+
+  setStatus('connecting', 'connecting…');
+  log('Connecting to ' + url, 'info');
+  connectBtn.disabled = true;
+
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    setStatus('connected', 'connected');
+    log('Connected.', 'ok');
+    micBtn.disabled = false;
+    disconnectBtn.disabled = false;
+    initPlaybackContext();
+  };
+
+  ws.onmessage = (event) => {
+    if (typeof event.data === 'string') {
+      log('Text message: ' + event.data, 'rx');
+      if (event.data === '__TURN_COMPLETE__') {
+        flushPlaybackQueue();
+      }
+      return;
+    }
+    // Binary audio chunk (PCM16, 24kHz) from the server
+    playAudioChunk(event.data);
+  };
+
+  ws.onerror = () => {
+    setStatus('error', 'error');
+    log('WebSocket error — check the URL and server logs.', 'err');
+  };
+
+  ws.onclose = (event) => {
+    setStatus('', 'disconnected');
+    log('Disconnected (code ' + event.code + (event.reason ? ', ' + event.reason : '') + ').',
+        event.code === 1000 ? 'info' : 'err');
+    connectBtn.disabled = false;
+    micBtn.disabled = true;
+    disconnectBtn.disabled = true;
+    stopMic();
+  };
+});
+
+disconnectBtn.addEventListener('click', () => {
+  if (ws) ws.close(1000, 'user disconnected');
+});
+
+// ---- Mic capture: mono PCM16 @ 16kHz, sent as binary frames -----------
+
+micBtn.addEventListener('click', async () => {
+  if (micStream) {
+    stopMic();
+    return;
+  }
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+    });
+  } catch (e) {
+    log('Mic access denied or unavailable: ' + e.message, 'err');
+    return;
+  }
+
+  micContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SEND_SAMPLE_RATE });
+  micSourceNode = micContext.createMediaStreamSource(micStream);
+
+  // ScriptProcessorNode is deprecated but has universal support and is
+  // fine for a test console. bufferSize 2048 @ 16kHz ≈ 128ms per chunk.
+  micProcessorNode = micContext.createScriptProcessor(2048, 1, 1);
+  micProcessorNode.onaudioprocess = (e) => {
+    const float32 = e.inputBuffer.getChannelData(0);
+    const pcm16 = floatTo16BitPCM(float32);
+
+    let peak = 0;
+    for (let i = 0; i < float32.length; i++) peak = Math.max(peak, Math.abs(float32[i]));
+    setMeter(txMeter, peak);
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(pcm16.buffer);
+    }
+  };
+
+  micSourceNode.connect(micProcessorNode);
+  // Some browsers require the processor node connected to a destination
+  // (even a silent one) to keep onaudioprocess firing.
+  micProcessorNode.connect(micContext.destination);
+
+  micBtn.textContent = 'Stop mic';
+  micBtn.classList.add('danger-btn');
+  log('Mic streaming started (16kHz PCM16).', 'ok');
+});
+
+function stopMic() {
+  if (micProcessorNode) { micProcessorNode.disconnect(); micProcessorNode = null; }
+  if (micSourceNode) { micSourceNode.disconnect(); micSourceNode = null; }
+  if (micContext) { micContext.close(); micContext = null; }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  micBtn.textContent = 'Start mic';
+  micBtn.classList.remove('danger-btn');
+  setMeter(txMeter, 0);
+}
+
+function floatTo16BitPCM(float32Array) {
+  const pcm16 = new Int16Array(float32Array.length);
+  for (let i = 0; i < float32Array.length; i++) {
+    let s = Math.max(-1, Math.min(1, float32Array[i]));
+    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return pcm16;
+}
+
+// ---- Playback: PCM16 @ 24kHz chunks scheduled back-to-back ------------
+
+function initPlaybackContext() {
+  playContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RECEIVE_SAMPLE_RATE });
+  nextPlayTime = playContext.currentTime;
+}
+
+function playAudioChunk(arrayBuffer) {
+  if (!playContext) initPlaybackContext();
+
+  const pcm16 = new Int16Array(arrayBuffer);
+  const float32 = new Float32Array(pcm16.length);
+  let peak = 0;
+  for (let i = 0; i < pcm16.length; i++) {
+    float32[i] = pcm16[i] / 0x8000;
+    peak = Math.max(peak, Math.abs(float32[i]));
+  }
+  setMeter(rxMeter, peak);
+
+  const audioBuffer = playContext.createBuffer(1, float32.length, RECEIVE_SAMPLE_RATE);
+  audioBuffer.copyToChannel(float32, 0);
+
+  const source = playContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(playContext.destination);
+
+  // Schedule chunks back-to-back instead of playing immediately, so
+  // consecutive chunks don't overlap or gap.
+  const now = playContext.currentTime;
+  const startAt = Math.max(now, nextPlayTime);
+  source.start(startAt);
+  nextPlayTime = startAt + audioBuffer.duration;
+
+  playbackQueue.push(source);
+  source.onended = () => {
+    playbackQueue = playbackQueue.filter(s => s !== source);
+  };
+}
+
+function flushPlaybackQueue() {
+  // Turn finished — stop anything still scheduled/playing so the next
+  // reply doesn't overlap with tail end of the previous one.
+  playbackQueue.forEach(source => {
+    try { source.stop(); } catch (e) { /* already stopped */ }
+  });
+  playbackQueue = [];
+  if (playContext) nextPlayTime = playContext.currentTime;
+  setMeter(rxMeter, 0);
+  log('Turn complete — playback buffer flushed.', 'info');
+}
+
+log('Ready. Enter the server URL and click Connect.', 'info');
+
+// Auto-fill the WS URL based on wherever this page is actually served
+// from, so it works whether opened via Render or a local dev server.
+(function () {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  if (window.location.host) {
+    urlField.value = proto + '//' + window.location.host + '/ws';
+  } else {
+    // Fallback for file:// (mic access won't work there on most browsers,
+    // but keep a sane default in the field)
+    urlField.value = 'wss://gemini-esp32-bridge-41q6.onrender.com/ws';
+  }
+})();
+</script>
+
+</body>
+</html>
