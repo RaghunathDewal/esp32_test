@@ -25,6 +25,7 @@ import logging
 import os
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -55,6 +56,10 @@ CONFIG = types.LiveConnectConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
         )
     ),
+    # Gemini transcribes the user's spoken audio and sends the text back
+    # alongside the audio reply — this is what lets us log what the user
+    # asked, without doing our own speech-to-text.
+    input_audio_transcription=types.AudioTranscriptionConfig(),
     tools=TOOLS,
 )
 
@@ -63,6 +68,18 @@ CONFIG = types.LiveConnectConfig(
 async def health():
     """Simple health check endpoint Render can ping."""
     return {"status": "ok", "service": "gemini-esp32-bridge"}
+
+
+@app.get("/console")
+async def console():
+    """
+    Serves the browser test console over HTTPS. Needed for testing from
+    iOS Safari (and mobile browsers generally) since getUserMedia (mic
+    access) requires a secure context — a local file:// page won't get
+    mic permission, but this route does since it's served over https://.
+    """
+    static_path = os.path.join(os.path.dirname(__file__), "static", "console.html")
+    return FileResponse(static_path, media_type="text/html")
 
 
 @app.websocket("/ws")
@@ -82,34 +99,73 @@ async def websocket_endpoint(websocket: WebSocket):
                 while True:
                     data = await websocket.receive_bytes()
                     await session.send_realtime_input(
-                        audio=types.Blob(data=data, mime_type="audio/pcm")
+                        audio=types.Blob(
+                            data=data,
+                            mime_type=f"audio/pcm;rate={SEND_SAMPLE_RATE}",
+                        )
                     )
 
             async def gemini_to_esp32():
-                """Read Gemini's audio/tool output and forward audio to the ESP32."""
-                while True:
-                    turn = session.receive()
-                    async for response in turn:
-                        if data := response.data:
-                            await websocket.send_bytes(data)
-                            continue
-                        if text := response.text:
-                            logger.info("Gemini text: %s", text)
-                        if tool_call := response.tool_call:
-                            await handle_tool_call(session, tool_call)
+                """Read Gemini's audio/tool output and forward audio to the ESP32.
 
-                    # Gemini signals end-of-turn here. If the user interrupts
-                    # mid-reply, a new turn starts before the old one drains —
-                    # tell the client to flush anything still queued so old
-                    # audio doesn't overlap/repeat under the new reply.
-                    await websocket.send_text("__TURN_COMPLETE__")
+                IMPORTANT: session.receive() is a single continuous stream —
+                it must be iterated once, not recreated in a loop. Turn
+                boundaries are detected via server_content.turn_complete,
+                not by the iterator ending (it doesn't end between turns).
+                """
+                async for response in session.receive():
+                    if data := response.data:
+                        await websocket.send_bytes(data)
+                        continue
+                    if text := response.text:
+                        logger.info("Gemini text: %s", text)
+                    if tool_call := response.tool_call:
+                        await handle_tool_call(session, tool_call)
 
-            await asyncio.gather(esp32_to_gemini(), gemini_to_esp32())
+                    server_content = getattr(response, "server_content", None)
+                    if server_content is not None:
+                        input_transcript = getattr(
+                            server_content, "input_transcription", None
+                        )
+                        if input_transcript is not None and input_transcript.text:
+                            logger.info("USER SAID: %s", input_transcript.text)
+
+                        if getattr(server_content, "turn_complete", False):
+                            # Tell the client to flush any stale queued
+                            # audio so an interruption's new turn doesn't
+                            # overlap with the previous one's leftovers.
+                            await websocket.send_text("__TURN_COMPLETE__")
+
+            sender = asyncio.create_task(esp32_to_gemini())
+            receiver = asyncio.create_task(gemini_to_esp32())
+
+            # If either side dies (client disconnects, Gemini closes the
+            # session, etc.) the other must stop too — otherwise one task
+            # keeps trying to read/write a session that's already gone,
+            # which is its own source of confusing errors.
+            done, pending = await asyncio.wait(
+                [sender, receiver], return_when=asyncio.FIRST_EXCEPTION
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+            # Re-raise whatever actually failed, so the outer except block
+            # still logs and closes the socket cleanly.
+            for task in done:
+                if task.exception():
+                    raise task.exception()
 
     except WebSocketDisconnect:
         logger.info("ESP32 client disconnected")
-    except Exception:
+    except Exception as e:
         logger.exception("Error in websocket session")
+        # google.genai's APIError often has empty response_json for Live
+        # API close codes — log every attribute that might carry detail
+        # so we're not stuck with just "1008 None" next time this happens.
+        for attr in ("code", "status_code", "reason", "response_json", "message", "args"):
+            if hasattr(e, attr):
+                logger.error("  %s = %r", attr, getattr(e, attr))
         try:
             await websocket.close(code=1011, reason="Internal error")
         except Exception:
@@ -135,7 +191,9 @@ async def handle_tool_call(session, tool_call):
             types.FunctionResponse(id=fc.id, name=fc.name, response=result)
         )
 
+    logger.info("Sending tool response...")
     await session.send_tool_response(function_responses=function_responses)
+    logger.info("Tool response sent.")
 
 
 if __name__ == "__main__":
