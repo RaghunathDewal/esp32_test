@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
@@ -19,8 +20,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gemini-esp32-bridge")
 
 MODEL = "models/gemini-3.1-flash-live-preview"
-SEND_SAMPLE_RATE = 16000      # audio coming FROM the ESP32 mic
-RECEIVE_SAMPLE_RATE = 24000   # audio going TO the ESP32 speaker
+SEND_SAMPLE_RATE = 16000
+RECEIVE_SAMPLE_RATE = 24000
+RECEIVE_BYTES_PER_SEC = RECEIVE_SAMPLE_RATE * 2  # 16-bit PCM mono
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
@@ -235,6 +237,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     """
                     while True:
                         turn = session.receive()
+                        chunk_count = 0
+                        turn_bytes = 0
+                        turn_started = time.monotonic()
 
                         async for response in turn:
                             try:
@@ -242,7 +247,21 @@ async def websocket_endpoint(websocket: WebSocket):
                                 # (audio + transcript + turn_complete), so every
                                 # field is checked -- never `continue` after audio.
                                 if data := response.data:
-                                    await websocket.send_bytes(data)
+                                    chunk_count += 1
+                                    turn_bytes += len(data)
+                                    try:
+                                        await websocket.send_bytes(data)
+                                    except Exception:
+                                        logger.exception(
+                                            "PCM send FAILED at chunk #%d (%d bytes, %d bytes sent so far this turn)",
+                                            chunk_count, len(data), turn_bytes - len(data),
+                                        )
+                                        raise
+                                    logger.info(
+                                        "PCM chunk #%d sent: %d bytes (turn total: %d bytes / %.2fs audio)",
+                                        chunk_count, len(data), turn_bytes,
+                                        turn_bytes / RECEIVE_BYTES_PER_SEC,
+                                    )
 
                                 if tool_call := response.tool_call:
                                     logger.info("Tool call requested: %s", tool_call)
@@ -267,14 +286,27 @@ async def websocket_endpoint(websocket: WebSocket):
                                     if getattr(sc, "interrupted", False):
                                         logger.info("Interrupted by user.")
                                         await websocket.send_text("__TURN_COMPLETE__")
+                            except (WebSocketDisconnect, ConnectionClosedError):
+                                # The ESP32 socket is gone -- stop pretending we can
+                                # still send it audio, let it propagate so the outer
+                                # loop reconnects/closes instead of looping forever.
+                                raise
                             except Exception:
                                 # One odd event must never kill the loop.
                                 logger.exception("Error handling one response — continuing")
 
                         # Generator ended => this turn is done. Tell the client to
                         # flush playback, then loop to receive the NEXT turn.
-                        logger.info("Turn complete.")
-                        await websocket.send_text("__TURN_COMPLETE__")
+                        elapsed = time.monotonic() - turn_started
+                        logger.info(
+                            "Turn complete: %d chunks, %d bytes (%.2fs audio) sent in %.2fs wall time",
+                            chunk_count, turn_bytes, turn_bytes / RECEIVE_BYTES_PER_SEC, elapsed,
+                        )
+                        try:
+                            await websocket.send_text("__TURN_COMPLETE__")
+                        except Exception:
+                            logger.exception("Failed to send __TURN_COMPLETE__ to client")
+                            raise
 
                 sender = asyncio.create_task(esp32_to_gemini())
                 receiver = asyncio.create_task(gemini_to_esp32())
