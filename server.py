@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from array import array
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
@@ -25,6 +26,39 @@ RECEIVE_SAMPLE_RATE = 24000
 RECEIVE_BYTES_PER_SEC = RECEIVE_SAMPLE_RATE * 2  # 16-bit PCM mono
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+
+class Resampler24to16:
+    """Streaming 24kHz -> 16kHz (3:2) PCM16-mono resampler, linear interpolation.
+
+    Stateful across chunks so chunk boundaries don't click. Handles odd-length
+    chunks by carrying the stray byte.
+    ponytail: no low-pass filter, fine for speech; swap in soxr if quality matters.
+    """
+
+    def __init__(self):
+        self.buf = array("h")  # unconsumed input samples
+        self.pos = 0.0         # next output position, in buf coordinates
+        self.odd = b""
+
+    def process(self, data: bytes) -> bytes:
+        data = self.odd + data
+        self.odd = data[-1:] if len(data) % 2 else b""
+        if self.odd:
+            data = data[:-1]
+        buf = self.buf
+        buf.frombytes(data)
+        out = array("h")
+        pos, n = self.pos, len(buf)
+        while pos + 1 < n:
+            i = int(pos)
+            out.append(int(buf[i] + (buf[i + 1] - buf[i]) * (pos - i)))
+            pos += 1.5  # 24000 / 16000
+        cut = int(pos)
+        self.buf = buf[cut:]
+        self.pos = pos - cut
+        return out.tobytes()
+
 
 app = FastAPI()
 
@@ -195,7 +229,11 @@ async def health():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    logger.info("ESP32 client connected")
+    output_rate = int(websocket.query_params.get("output_rate", RECEIVE_SAMPLE_RATE))
+    if output_rate not in (RECEIVE_SAMPLE_RATE, 16000):
+        logger.warning("Unsupported output_rate=%d, falling back to %d", output_rate, RECEIVE_SAMPLE_RATE)
+        output_rate = RECEIVE_SAMPLE_RATE
+    logger.info("ESP32 client connected (output_rate=%d)", output_rate)
 
     if not GEMINI_API_KEY:
         await websocket.close(code=1011, reason="Server missing GEMINI_API_KEY")
@@ -216,8 +254,16 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 async def esp32_to_gemini():
                     """Forward the client's mic audio to Gemini, unmodified."""
+                    mic_chunk_count = 0
+                    mic_bytes = 0
                     while True:
                         data = await websocket.receive_bytes()
+                        mic_chunk_count += 1
+                        mic_bytes += len(data)
+                        logger.info(
+                            "MIC chunk #%d received: %d bytes (session total: %d bytes / %.2fs audio)",
+                            mic_chunk_count, len(data), mic_bytes, mic_bytes / (SEND_SAMPLE_RATE * 2),
+                        )
                         await can_send_audio.wait()
                         await session.send_realtime_input(
                             audio=types.Blob(
@@ -240,6 +286,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         chunk_count = 0
                         turn_bytes = 0
                         turn_started = time.monotonic()
+                        resampler = Resampler24to16() if output_rate == 16000 else None
 
                         async for response in turn:
                             try:
@@ -249,18 +296,20 @@ async def websocket_endpoint(websocket: WebSocket):
                                 if data := response.data:
                                     chunk_count += 1
                                     turn_bytes += len(data)
-                                    try:
-                                        await websocket.send_bytes(data)
-                                    except Exception:
-                                        logger.exception(
-                                            "PCM send FAILED at chunk #%d (%d bytes, %d bytes sent so far this turn)",
-                                            chunk_count, len(data), turn_bytes - len(data),
-                                        )
-                                        raise
+                                    out = resampler.process(data) if resampler else data
+                                    if out:  # a tiny chunk can resample to 0 samples
+                                        try:
+                                            await websocket.send_bytes(out)
+                                        except Exception:
+                                            logger.exception(
+                                                "PCM send FAILED at chunk #%d (%d bytes, %d bytes received from Gemini so far this turn)",
+                                                chunk_count, len(out), turn_bytes - len(data),
+                                            )
+                                            raise
                                     logger.info(
-                                        "PCM chunk #%d sent: %d bytes (turn total: %d bytes / %.2fs audio)",
-                                        chunk_count, len(data), turn_bytes,
-                                        turn_bytes / RECEIVE_BYTES_PER_SEC,
+                                        "PCM chunk #%d: gemini=%d bytes -> sent=%d bytes @%dHz (turn total from Gemini: %d bytes / %.2fs audio)",
+                                        chunk_count, len(data), len(out), output_rate,
+                                        turn_bytes, turn_bytes / RECEIVE_BYTES_PER_SEC,
                                     )
 
                                 if tool_call := response.tool_call:

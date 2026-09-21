@@ -10,3 +10,6 @@ __pycache__/
 # Environment variables
 .env
 .env.*
+
+test_client_package/
+test_client_package.zip
