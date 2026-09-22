@@ -8,7 +8,18 @@ ESP32 (mic/speaker) <--WebSocket--> this server (Render) <--WebSocket--> Gemini 
 
 The ESP32 streams raw 16-bit PCM mono audio (16kHz) to the server as binary
 WebSocket frames. The server forwards it to Gemini Live, and streams
-Gemini's spoken response (24kHz PCM16) back to the ESP32 as binary frames.
+Gemini's spoken response (24kHz PCM16) back to the ESP32 as binary frames,
+resampling to 8kHz when the URL contains `?output_rate=16000`.
+
+The `16000` URL value is retained for the existing device, but the actual
+speaker audio is **8,000 Hz, mono PCM16**. Keep the ESP32 speaker/I2S clock at
+8kHz for this URL. Microphone input remains 16kHz. Without the parameter, or
+with `output_rate=24000`, output remains 24kHz passthrough.
+
+`static/console.html` defaults to `?output_rate=16000` and plays the received
+audio at 8kHz without rewriting that parameter. Its speaker label displays
+the actual PCM rate. The Python test client below still expects 24kHz output,
+so use its URL without the parameter.
 
 ## Folder structure
 
@@ -76,11 +87,11 @@ after idling will be slow (cold start) — fine for testing, not for production.
 On the ESP32 side, use a WebSocket client library (e.g. `arduinoWebSockets`
 or ESP-IDF's `esp_websocket_client`) to:
 
-1. Connect to `wss://<your-app-name>.onrender.com/ws`.
+1. Connect to `wss://<your-app-name>.onrender.com/ws?output_rate=16000`.
 2. Continuously send binary frames of raw 16-bit PCM mono audio at 16kHz
    captured from an I2S mic (e.g. INMP441).
 3. On receiving binary frames from the server, play them out via I2S to a
-   speaker/amp (24kHz PCM16).
+   speaker/amp (8kHz PCM16, despite the retained `16000` URL parameter).
 
 Keep ESP32-side chunk sizes small (e.g. 512–1024 bytes) to keep latency low.
 This server does no framing/encoding beyond raw PCM — match sample rate and
@@ -89,6 +100,10 @@ wrong.
 
 ## Notes / limitations (testing-level only)
 
+- The streaming resampler uses linear interpolation without an anti-alias
+  filter; frequencies above 4kHz can alias in 8kHz output.
+- Offline audio checks: `python test_resampler.py` and `python test_output_rate.py`.
+  Console playback/URL checks: `node test_console.js` (mocked browser audio).
 - No authentication on the WebSocket endpoint — anyone with the URL can
   connect and use your Gemini API quota. Add a token check before real use.
 - No reconnection/backoff logic on either side.

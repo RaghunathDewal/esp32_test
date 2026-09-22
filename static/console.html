@@ -202,7 +202,7 @@
         <div class="meter-track"><div id="txMeter" class="meter-fill"></div></div>
       </div>
       <div class="meter">
-        <div class="meter-label"><span>SPEAKER (receiving)</span><span id="rxLabel">24 kHz</span></div>
+        <div class="meter-label"><span>SPEAKER (receiving)</span><span id="rxLabel">8 kHz</span></div>
         <div class="meter-track"><div id="rxMeter" class="meter-fill rx"></div></div>
       </div>
     </div>
@@ -223,7 +223,7 @@ const txMeter = document.getElementById('txMeter');
 const rxMeter = document.getElementById('rxMeter');
 
 const SEND_SAMPLE_RATE = 16000;
-const RECEIVE_SAMPLE_RATE = 24000;
+let RECEIVE_SAMPLE_RATE = 8000; // actual PCM rate, not the device's URL parameter
 
 let ws = null;
 let micStream = null;
@@ -262,6 +262,14 @@ connectBtn.addEventListener('click', () => {
   const url = urlField.value.trim();
   if (!url) { log('Enter a WebSocket URL first.', 'err'); return; }
 
+  // Match the backend's device mapping without changing the URL:
+  // output_rate=16000 sends 8kHz PCM; absent/unsupported rates send 24kHz.
+  try {
+    const requestedRate = new URL(url).searchParams.get('output_rate') || '';
+    RECEIVE_SAMPLE_RATE = /^[+-]?\d+$/.test(requestedRate.trim()) && Number(requestedRate) === 16000 ? 8000 : 24000;
+  } catch (e) { RECEIVE_SAMPLE_RATE = 24000; }
+  document.getElementById('rxLabel').textContent = RECEIVE_SAMPLE_RATE / 1000 + ' kHz';
+
   setStatus('connecting', 'connecting…');
   log('Connecting to ' + url, 'info');
   connectBtn.disabled = true;
@@ -271,7 +279,7 @@ connectBtn.addEventListener('click', () => {
 
   ws.onopen = () => {
     setStatus('connected', 'connected');
-    log('Connected.', 'ok');
+    log('Connected. Speaker audio: ' + RECEIVE_SAMPLE_RATE / 1000 + ' kHz PCM16.', 'ok');
     micBtn.disabled = false;
     disconnectBtn.disabled = false;
     initPlaybackContext();
@@ -285,7 +293,7 @@ connectBtn.addEventListener('click', () => {
       }
       return;
     }
-    // Binary audio chunk (PCM16, 24kHz) from the server
+    // Binary PCM16 audio at the mapped receive rate from the server
     playAudioChunk(event.data);
   };
 
@@ -302,6 +310,8 @@ connectBtn.addEventListener('click', () => {
     micBtn.disabled = true;
     disconnectBtn.disabled = true;
     stopMic();
+    flushPlaybackQueue();
+    if (playContext) { playContext.close(); playContext = null; }
   };
 });
 
@@ -373,10 +383,12 @@ function floatTo16BitPCM(float32Array) {
   return pcm16;
 }
 
-// ---- Playback: PCM16 @ 24kHz chunks scheduled back-to-back ------------
+// ---- Playback: PCM16 at the mapped rate, scheduled back-to-back ------
 
 function initPlaybackContext() {
-  playContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RECEIVE_SAMPLE_RATE });
+  // Let the browser use its hardware rate; buffers below carry the PCM rate.
+  // Some audio devices cannot open an AudioContext directly at 8kHz.
+  playContext = new (window.AudioContext || window.webkitAudioContext)();
   nextPlayTime = playContext.currentTime;
 }
 
@@ -431,11 +443,11 @@ log('Ready. Enter the server URL and click Connect.', 'info');
 (function () {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   if (window.location.host) {
-    urlField.value = proto + '//' + window.location.host + '/ws';
+    urlField.value = proto + '//' + window.location.host + '/ws?output_rate=16000';
   } else {
     // Fallback for file:// (mic access won't work there on most browsers,
     // but keep a sane default in the field)
-    urlField.value = 'wss://gemini-esp32-bridge-41q6.onrender.com/ws';
+    urlField.value = 'wss://gemini-esp32-bridge-41q6.onrender.com/ws?output_rate=16000';
   }
 })();
 </script>

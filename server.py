@@ -28,17 +28,22 @@ RECEIVE_BYTES_PER_SEC = RECEIVE_SAMPLE_RATE * 2  # 16-bit PCM mono
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 
-class Resampler24to16:
-    """Streaming 24kHz -> 16kHz (3:2) PCM16-mono resampler, linear interpolation.
+class Resampler24kHz:
+    """Streaming 24kHz -> target_rate PCM16-mono resampler, linear interpolation.
 
-    Stateful across chunks so chunk boundaries don't click. Handles odd-length
-    chunks by carrying the stray byte.
-    ponytail: no low-pass filter, fine for speech; swap in soxr if quality matters.
+    Position is tracked as an exact integer fraction (pos_num / dst), not a
+    float -- a float accumulator drifts by epsilon over many chunks, and at
+    ratios like 3:1 every output sample lands exactly on an input sample, so
+    that epsilon flips int() to the wrong index (an audible click). Integer
+    math has zero drift regardless of how the input is chunked.
+    No low-pass filter: frequencies above the target Nyquist limit can alias.
     """
 
-    def __init__(self):
+    def __init__(self, target_rate: int):
+        self.src = RECEIVE_SAMPLE_RATE
+        self.dst = target_rate
         self.buf = array("h")  # unconsumed input samples
-        self.pos = 0.0         # next output position, in buf coordinates
+        self.pos_num = 0       # next output position = pos_num / dst, in buf coordinates
         self.odd = b""
 
     def process(self, data: bytes) -> bytes:
@@ -49,14 +54,18 @@ class Resampler24to16:
         buf = self.buf
         buf.frombytes(data)
         out = array("h")
-        pos, n = self.pos, len(buf)
-        while pos + 1 < n:
-            i = int(pos)
-            out.append(int(buf[i] + (buf[i + 1] - buf[i]) * (pos - i)))
-            pos += 1.5  # 24000 / 16000
-        cut = int(pos)
+        pos_num, n, src, dst = self.pos_num, len(buf), self.src, self.dst
+        while True:
+            i, frac = divmod(pos_num, dst)
+            if i >= n or (frac and i + 1 >= n):
+                break
+            out.append(int(buf[i] + (buf[i + 1] - buf[i]) * frac / dst) if frac else buf[i])
+            pos_num += src
+        # Only subtract samples actually discarded; tiny chunks may end
+        # before the next output position, especially at the 3:1 ratio.
+        cut = min(pos_num // dst, n)
         self.buf = buf[cut:]
-        self.pos = pos - cut
+        self.pos_num = pos_num - cut * dst
         return out.tobytes()
 
 
@@ -229,11 +238,18 @@ async def health():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    output_rate = int(websocket.query_params.get("output_rate", RECEIVE_SAMPLE_RATE))
+    try:
+        output_rate = int(websocket.query_params.get("output_rate", RECEIVE_SAMPLE_RATE))
+    except ValueError:
+        output_rate = RECEIVE_SAMPLE_RATE
     if output_rate not in (RECEIVE_SAMPLE_RATE, 16000):
         logger.warning("Unsupported output_rate=%d, falling back to %d", output_rate, RECEIVE_SAMPLE_RATE)
         output_rate = RECEIVE_SAMPLE_RATE
-    logger.info("ESP32 client connected (output_rate=%d)", output_rate)
+    # Device firmware asks for output_rate=16000 but its I2S clock is actually
+    # set to 8kHz -- map the requested rate to what we actually send instead
+    # of touching the device's URL. Passthrough (24000, no param) is unaffected.
+    actual_rate = 8000 if output_rate == 16000 else output_rate
+    logger.info("ESP32 client connected (requested output_rate=%d, sending %d)", output_rate, actual_rate)
 
     if not GEMINI_API_KEY:
         await websocket.close(code=1011, reason="Server missing GEMINI_API_KEY")
@@ -286,7 +302,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         chunk_count = 0
                         turn_bytes = 0
                         turn_started = time.monotonic()
-                        resampler = Resampler24to16() if output_rate == 16000 else None
+                        resampler = Resampler24kHz(actual_rate) if actual_rate != RECEIVE_SAMPLE_RATE else None
 
                         async for response in turn:
                             try:
@@ -308,7 +324,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                             raise
                                     logger.info(
                                         "PCM chunk #%d: gemini=%d bytes -> sent=%d bytes @%dHz (turn total from Gemini: %d bytes / %.2fs audio)",
-                                        chunk_count, len(data), len(out), output_rate,
+                                        chunk_count, len(data), len(out), actual_rate,
                                         turn_bytes, turn_bytes / RECEIVE_BYTES_PER_SEC,
                                     )
 
