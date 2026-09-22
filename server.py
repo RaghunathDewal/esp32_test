@@ -242,14 +242,10 @@ async def websocket_endpoint(websocket: WebSocket):
         output_rate = int(websocket.query_params.get("output_rate", RECEIVE_SAMPLE_RATE))
     except ValueError:
         output_rate = RECEIVE_SAMPLE_RATE
-    if output_rate not in (RECEIVE_SAMPLE_RATE, 16000):
+    if output_rate not in (RECEIVE_SAMPLE_RATE, 16000, 8000):
         logger.warning("Unsupported output_rate=%d, falling back to %d", output_rate, RECEIVE_SAMPLE_RATE)
         output_rate = RECEIVE_SAMPLE_RATE
-    # Device firmware asks for output_rate=16000 but its I2S clock is actually
-    # set to 8kHz -- map the requested rate to what we actually send instead
-    # of touching the device's URL. Passthrough (24000, no param) is unaffected.
-    actual_rate = 8000 if output_rate == 16000 else output_rate
-    logger.info("ESP32 client connected (requested output_rate=%d, sending %d)", output_rate, actual_rate)
+    logger.info("ESP32 client connected (output_rate=%d)", output_rate)
 
     if not GEMINI_API_KEY:
         await websocket.close(code=1011, reason="Server missing GEMINI_API_KEY")
@@ -302,7 +298,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         chunk_count = 0
                         turn_bytes = 0
                         turn_started = time.monotonic()
-                        resampler = Resampler24kHz(actual_rate) if actual_rate != RECEIVE_SAMPLE_RATE else None
+                        resampler = Resampler24kHz(output_rate) if output_rate != RECEIVE_SAMPLE_RATE else None
 
                         async for response in turn:
                             try:
@@ -324,7 +320,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                             raise
                                     logger.info(
                                         "PCM chunk #%d: gemini=%d bytes -> sent=%d bytes @%dHz (turn total from Gemini: %d bytes / %.2fs audio)",
-                                        chunk_count, len(data), len(out), actual_rate,
+                                        chunk_count, len(data), len(out), output_rate,
                                         turn_bytes, turn_bytes / RECEIVE_BYTES_PER_SEC,
                                     )
 
